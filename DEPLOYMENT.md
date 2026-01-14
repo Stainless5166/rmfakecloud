@@ -12,14 +12,16 @@ rmfakecloud is a self-hosted replacement for the reMarkable cloud service, enabl
 
 1. [Verified Feature Set](#verified-feature-set)
 2. [System Architecture](#system-architecture)
-3. [Deployment Requirements](#deployment-requirements)
-4. [Deployment Scenarios](#deployment-scenarios)
-5. [Security Considerations](#security-considerations)
-6. [Multi-Device Configuration](#multi-device-configuration)
-7. [Backup and Data Management](#backup-and-data-management)
-8. [Monitoring and Maintenance](#monitoring-and-maintenance)
-9. [Troubleshooting](#troubleshooting)
-10. [Known Limitations](#known-limitations)
+3. [Healthcare/Medical Facility Deployment](#healthcaremedical-facility-deployment)
+4. [Deployment Requirements](#deployment-requirements)
+5. [Deployment Scenarios](#deployment-scenarios)
+6. [Security Considerations](#security-considerations)
+7. [Multi-Device Configuration](#multi-device-configuration)
+8. [Document Lifecycle Management](#document-lifecycle-management)
+9. [Backup and Data Management](#backup-and-data-management)
+10. [Monitoring and Maintenance](#monitoring-and-maintenance)
+11. [Troubleshooting](#troubleshooting)
+12. [Known Limitations](#known-limitations)
 
 ---
 
@@ -169,6 +171,876 @@ rmfakecloud is a self-hosted replacement for the reMarkable cloud service, enabl
 - **MQTT:** Embedded broker with TLS
 - **Storage:** File-based (configurable directory)
 - **Build:** Docker multi-stage build (from scratch image)
+
+---
+
+## Healthcare/Medical Facility Deployment
+
+### Overview
+
+This section addresses specific considerations for deploying rmfakecloud in healthcare settings where reMarkable tablets are used for:
+- Clinical note-taking
+- Paperless form filling
+- Patient chart annotations
+- Medical documentation
+
+**Critical Understanding:** Protected Health Information (PHI) and personally identifiable information (PII) will be stored on both the tablets and the rmfakecloud server. Proper security controls, lifecycle management, and compliance procedures are essential.
+
+### Compliance Considerations
+
+#### HIPAA Compliance (U.S. Healthcare)
+
+rmfakecloud is **not HIPAA-compliant out of the box**. To use in a HIPAA-covered entity environment, you must implement additional controls:
+
+**Required Technical Safeguards:**
+
+1. **Access Controls (§164.312(a)(1))**
+   - ✅ User authentication (JWT-based) - **Implemented**
+   - ❌ Role-based access control - **Not implemented** (all users have equal permissions)
+   - ❌ Automatic logoff - **Not implemented** (sessions expire after 24 hours)
+   - ⚠️ Unique user identification - **Partially implemented** (email-based, but no audit trail)
+
+2. **Audit Controls (§164.312(b))**
+   - ❌ **NOT IMPLEMENTED** - rmfakecloud does not log PHI access by default
+   - **Action Required:** Implement external audit logging (see [Audit Logging](#audit-logging) below)
+
+3. **Integrity (§164.312(c)(1))**
+   - ✅ Data integrity during transmission (TLS)
+   - ⚠️ File checksums maintained for sync
+   - ❌ No built-in integrity monitoring or tampering detection
+
+4. **Transmission Security (§164.312(e)(1))**
+   - ✅ TLS encryption for data in transit - **Can be implemented**
+   - ⚠️ Requires proper TLS configuration (see Security section)
+
+5. **Encryption at Rest (Addressable)**
+   - ❌ **NOT IMPLEMENTED** in application
+   - **Action Required:** Use filesystem-level encryption (LUKS, dm-crypt)
+
+**Required Administrative Safeguards:**
+
+- Business Associate Agreements (BAA): Open-source software has no vendor to sign BAA with
+- Security policies and procedures: Must be documented separately
+- Workforce training: Required for proper PHI handling
+- Contingency planning: Backup and disaster recovery (covered in [Backup Section](#backup-and-data-management))
+
+**Physical Safeguards:**
+
+- Server must be in secure, access-controlled location
+- Tablets must have screen locks and encryption enabled
+- Consider asset management for tablet tracking
+
+**Recommendation:** Consult with HIPAA compliance officer and legal counsel before deploying for PHI storage.
+
+#### Other Regulatory Frameworks
+
+- **GDPR (EU):** Personal data processing requires legal basis, data protection measures, and subject rights implementation
+- **PIPEDA (Canada):** Similar requirements for personal health information
+- **State Privacy Laws:** California CPRA, etc., may apply
+
+### Document Lifecycle Management
+
+#### Centralized Document Control
+
+rmfakecloud supports **server-side document lifecycle management** with automatic synchronization to tablets:
+
+**Key Capability:** When files are deleted from the server's user directory, they are automatically deleted from tablets on next sync.
+
+**Verified in Code:** `/internal/storage/fs/documents.go` line 123-147
+
+**How It Works:**
+
+1. **Deletion from Web UI:**
+   ```
+   Admin deletes document via web interface
+   → Document moved to `.trash` folder in user directory
+   → On next sync, tablet receives deletion instruction
+   → Document removed from tablet
+   ```
+
+2. **Deletion from Server Filesystem:**
+   ```
+   Admin deletes files from /data/users/<user-id>/ directory
+   → On next sync, tablets detect missing files
+   → Tablets delete local copies to match server state
+   ```
+
+3. **Bulk Deletion:**
+   ```bash
+   # Delete all documents for a specific user older than 90 days
+   find /data/users/<user-id>/ -name "*.zip" -mtime +90 -delete
+   find /data/users/<user-id>/ -name "*.metadata" -mtime +90 -delete
+   # On next sync, tablets will remove these documents
+   ```
+
+**Important Warnings:**
+
+⚠️ **Deletion is NOT immediate** - Tablets must connect and sync for deletion to take effect
+⚠️ **No confirmation mechanism** - Cannot verify document was deleted from tablet without manual inspection
+⚠️ **Offline tablets retain data** - If a tablet never syncs, it will keep deleted documents indefinitely
+⚠️ **Trash folder persists** - Documents in `.trash` are not automatically purged
+
+#### Document Retention Policies
+
+**Implementing Retention:**
+
+```bash
+#!/bin/bash
+# retention-policy.sh - Enforce document retention on rmfakecloud server
+
+DATA_DIR="/path/to/rmfakecloud/data/users"
+RETENTION_DAYS=2555  # 7 years for medical records
+LOG_FILE="/var/log/rmfakecloud-retention.log"
+
+# Find and remove documents older than retention period
+for user_dir in "$DATA_DIR"/*; do
+    user=$(basename "$user_dir")
+
+    # Find old documents
+    old_docs=$(find "$user_dir" -name "*.zip" -mtime +"$RETENTION_DAYS")
+
+    if [ -n "$old_docs" ]; then
+        echo "$(date): Removing expired documents for user $user" >> "$LOG_FILE"
+
+        # Delete documents and metadata
+        find "$user_dir" -name "*.zip" -mtime +"$RETENTION_DAYS" -delete
+        find "$user_dir" -name "*.metadata" -mtime +"$RETENTION_DAYS" -delete
+
+        # Log document IDs that were deleted
+        echo "$old_docs" >> "$LOG_FILE"
+    fi
+done
+
+# Purge trash older than 30 days
+find "$DATA_DIR"/*/".trash" -type f -mtime +30 -delete
+
+echo "$(date): Retention policy executed" >> "$LOG_FILE"
+```
+
+**Cron Schedule:**
+```cron
+# Run retention policy daily at 3 AM
+0 3 * * * /usr/local/bin/retention-policy.sh
+```
+
+**Retention Recommendations by Document Type:**
+
+| Document Type | Recommended Retention | Legal Basis |
+|---------------|----------------------|-------------|
+| Patient clinical notes | 7 years (2555 days) | HIPAA, state law |
+| Pediatric records | 7 years after age 18 | State requirements |
+| Consent forms | 7 years | Legal requirement |
+| Administrative notes | 1 year (365 days) | Internal policy |
+| Temporary forms | 30 days | Internal policy |
+
+#### Remote Document Management
+
+**Via Web Interface:**
+
+Administrators can manage documents through the web UI:
+
+```
+https://rmfakecloud.company.internal/
+→ Login as admin
+→ Navigate to user's document list
+→ Select documents
+→ Delete (moves to trash)
+→ Documents removed from tablets on next sync
+```
+
+**Via API (Programmatic):**
+
+```bash
+# Authenticate
+TOKEN=$(curl -s -X POST https://rmfakecloud.company.internal/ui/api/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"admin@company.internal","password":"admin-password"}')
+
+# List user documents
+curl -H "Cookie: .Authrmfakecloud=$TOKEN" \
+  https://rmfakecloud.company.internal/ui/api/documents
+
+# Delete document
+curl -X DELETE -H "Cookie: .Authrmfakecloud=$TOKEN" \
+  https://rmfakecloud.company.internal/ui/api/documents/<document-id>
+```
+
+**Via Direct Filesystem (Bulk Operations):**
+
+```bash
+# SSH to rmfakecloud server
+
+# Delete specific document by ID
+rm /data/users/<user-id>/<document-id>.zip
+rm /data/users/<user-id>/<document-id>.metadata
+
+# Delete all documents for terminated user
+rm -rf /data/users/<user-id>/*
+
+# Tablets will remove documents on next sync
+```
+
+#### Limitations and Workarounds
+
+**Limitation 1: No Forced Sync**
+- Cannot force tablets to sync immediately
+- **Workaround:** Establish policy requiring daily syncs; monitor last-sync timestamps
+
+**Limitation 2: No Remote Wipe**
+- Cannot remotely wipe tablet if lost/stolen
+- **Workaround:**
+  - Enable reMarkable's built-in device password
+  - Use tablet asset management
+  - Document decommissioning procedure
+
+**Limitation 3: No Deletion Confirmation**
+- Cannot verify document was removed from tablet
+- **Workaround:** Manual verification procedure or audit script
+
+**Limitation 4: Offline Retention**
+- Tablets that never connect retain all documents
+- **Workaround:** Policy requiring regular connectivity; disable WiFi-only tablets
+
+### Audit Logging
+
+rmfakecloud does **not** provide built-in PHI access logging. For HIPAA compliance, implement external audit logging.
+
+#### Option 1: Reverse Proxy Logging (nginx)
+
+```nginx
+# /etc/nginx/sites-available/rmfakecloud
+
+log_format rmfakecloud_audit '$remote_addr - $remote_user [$time_local] '
+                              '"$request" $status $body_bytes_sent '
+                              '"$http_referer" "$http_user_agent" '
+                              'auth="$http_authorization" cookie="$http_cookie"';
+
+server {
+    listen 443 ssl http2;
+    server_name rmfakecloud.company.internal;
+
+    # Separate audit log
+    access_log /var/log/nginx/rmfakecloud-audit.log rmfakecloud_audit;
+
+    # ... rest of config
+}
+```
+
+**Log Rotation:**
+```bash
+# /etc/logrotate.d/rmfakecloud-audit
+/var/log/nginx/rmfakecloud-audit.log {
+    daily
+    rotate 2555  # 7 years
+    compress
+    delaycompress
+    notifempty
+    create 0640 www-data adm
+    sharedscripts
+    postrotate
+        [ -f /var/run/nginx.pid ] && kill -USR1 `cat /var/run/nginx.pid`
+    endscript
+}
+```
+
+#### Option 2: Syslog Integration
+
+```yaml
+# docker-compose.yml
+services:
+  rmfakecloud:
+    # ... other config ...
+    logging:
+      driver: syslog
+      options:
+        syslog-address: "tcp://syslog-server.company.internal:514"
+        tag: "rmfakecloud"
+        syslog-format: "rfc5424"
+```
+
+**SIEM Integration:** Forward syslog to Splunk, ELK Stack, or QRadar for compliance monitoring.
+
+#### Option 3: Filesystem Auditing (auditd)
+
+```bash
+# Monitor file access in data directory
+auditctl -w /data/users -p rwxa -k rmfakecloud_phi_access
+
+# Watch for deletions
+auditctl -w /data/users -p d -k rmfakecloud_phi_delete
+
+# Query audit logs
+ausearch -k rmfakecloud_phi_access -ts recent
+```
+
+#### Audit Log Requirements
+
+For HIPAA compliance, logs must include:
+- User identity (email/username)
+- Timestamp (accurate, synchronized with NTP)
+- Action performed (create, read, update, delete)
+- Document/resource accessed
+- Source IP address
+- Success/failure indication
+
+**Retention:** Audit logs must be retained for **6 years** (HIPAA requirement).
+
+### Device Management
+
+#### Device Enrollment
+
+Track all tablets in inventory management system:
+
+```bash
+# Device enrollment script
+# /usr/local/bin/enroll-tablet.sh
+
+DEVICE_IP="$1"
+USER_EMAIL="$2"
+ASSET_TAG="$3"
+
+# SSH to tablet and get device info
+DEVICE_ID=$(ssh root@"$DEVICE_IP" "cat /sys/class/net/wlan0/address")
+SERIAL=$(ssh root@"$DEVICE_IP" "cat /proc/device-tree/serial-number")
+
+# Record in inventory database/spreadsheet
+echo "$(date),$ASSET_TAG,$SERIAL,$DEVICE_ID,$USER_EMAIL,Enrolled" >> /var/lib/rmfakecloud/device-inventory.csv
+
+echo "Tablet enrolled: Asset $ASSET_TAG assigned to $USER_EMAIL"
+```
+
+**Inventory Tracking:**
+
+| Asset Tag | Serial Number | MAC Address | Assigned User | Status | Last Sync |
+|-----------|---------------|-------------|---------------|--------|-----------|
+| RM-001 | ABC123 | 00:11:22:33:44:55 | dr.smith@hospital.internal | Active | 2026-01-14 08:30 |
+| RM-002 | ABC124 | 00:11:22:33:44:56 | nurse.jones@hospital.internal | Active | 2026-01-14 09:15 |
+
+#### Device Decommissioning
+
+When a tablet is lost, stolen, or decommissioned:
+
+```bash
+#!/bin/bash
+# decommission-tablet.sh
+
+USER_EMAIL="$1"
+REASON="$2"  # lost, stolen, retired, etc.
+
+# 1. Delete user's data from server (forces deletion on tablet if it syncs)
+rm -rf /data/users/"$USER_EMAIL"/*
+
+# 2. Disable user account
+docker exec rmfakecloud /rmfakecloud-docker deleteuser "$USER_EMAIL"
+
+# 3. Log the decommissioning
+echo "$(date): Decommissioned $USER_EMAIL - Reason: $REASON" >> /var/log/rmfakecloud-decommission.log
+
+# 4. If stolen, contact security team
+if [ "$REASON" = "stolen" ]; then
+    echo "ALERT: Tablet stolen for user $USER_EMAIL" | mail -s "Security Alert" security@company.internal
+fi
+
+echo "User $USER_EMAIL decommissioned. Data deleted from server."
+echo "NOTE: If tablet was lost/stolen, PHI may still be on device."
+echo "Physical recovery or remote wipe not possible with rmfakecloud."
+```
+
+**Important:** rmfakecloud has **no remote wipe capability**. Lost or stolen tablets may still contain PHI. This is a significant limitation for healthcare deployments.
+
+**Mitigation:**
+- Require device passwords on all tablets
+- Encrypt tablet storage (if supported by reMarkable OS)
+- Maintain physical security of tablets
+- Consider tablet insurance and tracking
+
+#### Monitoring Last Sync Times
+
+```bash
+#!/bin/bash
+# check-sync-status.sh - Alert on tablets that haven't synced recently
+
+DATA_DIR="/data/users"
+MAX_DAYS=1  # Alert if not synced in 1 day
+
+for user_dir in "$DATA_DIR"/*; do
+    user=$(basename "$user_dir")
+
+    # Find most recent file modification
+    last_sync=$(find "$user_dir" -type f -printf '%T@\n' | sort -n | tail -1)
+
+    if [ -z "$last_sync" ]; then
+        continue
+    fi
+
+    # Calculate days since last sync
+    current_time=$(date +%s)
+    days_since_sync=$(( (current_time - ${last_sync%.*}) / 86400 ))
+
+    if [ "$days_since_sync" -gt "$MAX_DAYS" ]; then
+        echo "WARNING: User $user has not synced in $days_since_sync days" | \
+            mail -s "rmfakecloud Sync Alert" admin@company.internal
+    fi
+done
+```
+
+**Cron:**
+```cron
+# Check sync status every 6 hours
+0 */6 * * * /usr/local/bin/check-sync-status.sh
+```
+
+### Data Sanitization
+
+#### Permanent Deletion
+
+When documents must be permanently deleted (e.g., patient request, legal requirement):
+
+```bash
+#!/bin/bash
+# secure-delete.sh - Permanently delete document with verification
+
+USER="$1"
+DOCUMENT_ID="$2"
+
+DATA_DIR="/data/users/$USER"
+
+# 1. Remove from active storage
+rm -f "$DATA_DIR/$DOCUMENT_ID.zip"
+rm -f "$DATA_DIR/$DOCUMENT_ID.metadata"
+
+# 2. Remove from trash
+rm -f "$DATA_DIR/.trash/$DOCUMENT_ID.zip"
+rm -f "$DATA_DIR/.trash/$DOCUMENT_ID.metadata"
+
+# 3. Remove from cache
+rm -f "$DATA_DIR/.cache/$DOCUMENT_ID"*
+
+# 4. Remove from sync folder (if using sync15)
+rm -rf "$DATA_DIR/sync/$DOCUMENT_ID"*
+
+# 5. Overwrite with zeros (optional, for compliance)
+# Note: Filesystem must not use copy-on-write (ZFS, Btrfs)
+# shred -vfz -n 3 "$DATA_DIR/$DOCUMENT_ID"*
+
+# 6. Log deletion for audit
+echo "$(date): Securely deleted document $DOCUMENT_ID for user $USER" >> /var/log/rmfakecloud-deletions.log
+
+# 7. Force sync on user's tablets (they must connect)
+echo "Document deleted. User $USER must sync tablets to complete deletion."
+```
+
+**Limitation:** Secure deletion (overwriting) may not work on:
+- Copy-on-write filesystems (ZFS, Btrfs)
+- SSD drives (wear leveling)
+- Compressed/deduplicated storage
+- Backup media
+
+**For true secure deletion:** Use encrypted storage and securely delete encryption keys.
+
+#### User Account Purge
+
+Complete removal of user and all data:
+
+```bash
+#!/bin/bash
+# purge-user.sh - Complete user data removal
+
+USER_EMAIL="$1"
+
+# 1. Export data for archival if required by law
+tar -czf "/backup/archive/user-$USER_EMAIL-$(date +%Y%m%d).tar.gz" /data/users/"$USER_EMAIL"/
+
+# 2. Delete user directory
+rm -rf /data/users/"$USER_EMAIL"
+
+# 3. Remove user account
+docker exec rmfakecloud /rmfakecloud-docker deleteuser "$USER_EMAIL"
+
+# 4. Update inventory
+sed -i "/$USER_EMAIL/d" /var/lib/rmfakecloud/device-inventory.csv
+
+# 5. Log purge
+echo "$(date): Purged user $USER_EMAIL completely" >> /var/log/rmfakecloud-purge.log
+
+echo "User $USER_EMAIL purged from system"
+```
+
+### Best Practices for Healthcare Deployment
+
+#### 1. Network Segmentation
+- Place rmfakecloud server on dedicated healthcare VLAN
+- Isolate from guest network and general corporate network
+- Use firewall rules to restrict access to authorized devices only
+
+#### 2. Regular Security Audits
+- Quarterly review of access logs
+- Annual penetration testing
+- Regular vulnerability assessments
+
+#### 3. User Training
+- PHI handling procedures
+- Tablet security (screen locks, physical security)
+- Reporting lost/stolen devices
+- Proper logout procedures
+
+#### 4. Incident Response Plan
+```
+Lost/Stolen Tablet Procedure:
+1. User reports loss immediately
+2. IT runs decommission-tablet.sh
+3. Data deleted from server
+4. User account disabled
+5. Security team notified
+6. Incident logged
+7. User assigned new tablet with new credentials
+```
+
+#### 5. Business Continuity
+- Daily backups with 7-year retention
+- Tested disaster recovery procedures
+- Redundant hardware available
+- Documentation of all procedures
+
+#### 6. Acceptable Use Policy
+
+**Sample Policy Elements:**
+- Tablets are for authorized clinical use only
+- No personal use of tablets
+- Tablets must not leave facility premises (unless authorized)
+- Tablets must be locked when unattended
+- Users must sync tablets daily
+- Lost/stolen tablets must be reported within 1 hour
+- PHI must not be shared or displayed in public areas
+- Screen sharing feature disabled (unless required and approved)
+
+---
+
+## Document Lifecycle Management
+
+This section provides detailed procedures for managing document lifecycles directly on tablets through server-side operations.
+
+### Understanding Sync Behavior
+
+rmfakecloud uses a **bidirectional sync model**:
+
+- **Tablet → Server:** New/modified documents uploaded to server
+- **Server → Tablet:** Server state is authoritative; deletions propagate to tablets
+
+**Critical Sync Rule:** Files deleted from the server user directory will be deleted from tablets on next sync.
+
+**Verification:** Confirmed in `/home/user/rmfakecloud/README.md` line 59:
+> "if you delete files from the users directory on the host, on the next sync those will be deleted from the device"
+
+### Server-Side Document Operations
+
+#### Viewing User Documents
+
+```bash
+# List all documents for a user
+ls -lh /data/users/<user-email>/
+
+# Output:
+# -rw------- 1 1000 1000  2.3M Jan 14 10:30 abc123def.zip
+# -rw------- 1 1000 1000   512 Jan 14 10:30 abc123def.metadata
+# -rw------- 1 1000 1000  1.8M Jan 13 15:22 xyz789ghi.zip
+# -rw------- 1 1000 1000   498 Jan 13 15:22 xyz789ghi.metadata
+
+# For sync15 users, documents are in sync folder
+ls -lh /data/users/<user-email>/sync/
+```
+
+#### Metadata Inspection
+
+```bash
+# View document metadata (JSON format)
+cat /data/users/<user-email>/abc123def.metadata
+
+# Extract document name
+jq -r '.VisibleName' /data/users/<user-email>/abc123def.metadata
+
+# Find all documents modified in last 7 days
+find /data/users/<user-email>/ -name "*.metadata" -mtime -7 -exec jq -r '.VisibleName' {} \;
+```
+
+#### Bulk Document Management
+
+```bash
+#!/bin/bash
+# bulk-document-operations.sh
+
+USER_EMAIL="$1"
+OPERATION="$2"  # list, delete-old, archive, export
+
+USER_DIR="/data/users/$USER_EMAIL"
+
+case "$OPERATION" in
+    list)
+        # List all documents with names
+        for metadata in "$USER_DIR"/*.metadata; do
+            doc_id=$(basename "$metadata" .metadata)
+            doc_name=$(jq -r '.VisibleName' "$metadata" 2>/dev/null || echo "Unknown")
+            doc_date=$(stat -c %y "$metadata" | cut -d' ' -f1)
+            echo "$doc_id | $doc_name | $doc_date"
+        done
+        ;;
+
+    delete-old)
+        # Delete documents older than specified days
+        DAYS="${3:-90}"
+        echo "Deleting documents older than $DAYS days for $USER_EMAIL"
+
+        find "$USER_DIR" -name "*.zip" -mtime +"$DAYS" | while read -r zipfile; do
+            doc_id=$(basename "$zipfile" .zip)
+            doc_name=$(jq -r '.VisibleName' "$USER_DIR/$doc_id.metadata" 2>/dev/null || echo "Unknown")
+
+            echo "Deleting: $doc_name ($doc_id)"
+            rm -f "$zipfile"
+            rm -f "$USER_DIR/$doc_id.metadata"
+        done
+        ;;
+
+    archive)
+        # Archive documents to external storage
+        ARCHIVE_DIR="/backup/archive/$USER_EMAIL"
+        mkdir -p "$ARCHIVE_DIR"
+
+        tar -czf "$ARCHIVE_DIR/archive-$(date +%Y%m%d-%H%M%S).tar.gz" \
+            -C "$USER_DIR" .
+
+        echo "Archived to $ARCHIVE_DIR"
+        ;;
+
+    export)
+        # Export document list to CSV
+        echo "DocumentID,Name,ModifiedDate,Size" > "/tmp/$USER_EMAIL-docs.csv"
+
+        for metadata in "$USER_DIR"/*.metadata; do
+            doc_id=$(basename "$metadata" .metadata)
+            doc_name=$(jq -r '.VisibleName' "$metadata" 2>/dev/null || echo "Unknown")
+            doc_date=$(stat -c %y "$metadata" | cut -d' ' -f1)
+            doc_size=$(stat -c %s "$USER_DIR/$doc_id.zip" 2>/dev/null || echo "0")
+
+            echo "$doc_id,\"$doc_name\",$doc_date,$doc_size" >> "/tmp/$USER_EMAIL-docs.csv"
+        done
+
+        echo "Exported to /tmp/$USER_EMAIL-docs.csv"
+        ;;
+esac
+```
+
+**Usage:**
+```bash
+# List all documents for user
+./bulk-document-operations.sh dr.smith@hospital.internal list
+
+# Delete documents older than 60 days
+./bulk-document-operations.sh dr.smith@hospital.internal delete-old 60
+
+# Archive all documents
+./bulk-document-operations.sh dr.smith@hospital.internal archive
+
+# Export document inventory
+./bulk-document-operations.sh dr.smith@hospital.internal export
+```
+
+### Automated Lifecycle Policies
+
+```bash
+#!/bin/bash
+# lifecycle-manager.sh - Automated document lifecycle management
+
+DATA_DIR="/data/users"
+POLICY_CONFIG="/etc/rmfakecloud/lifecycle-policy.conf"
+
+# Load policy configuration
+# Format: document_pattern,retention_days,action
+# Example:
+# "Temp*,7,delete"
+# "Patient Chart*,2555,archive"
+# "Form*,30,delete"
+
+while IFS=',' read -r pattern retention action; do
+    echo "Processing policy: Pattern=$pattern, Retention=$retention days, Action=$action"
+
+    for user_dir in "$DATA_DIR"/*; do
+        user=$(basename "$user_dir")
+
+        # Find matching documents
+        for metadata in "$user_dir"/*.metadata; do
+            [ -f "$metadata" ] || continue
+
+            doc_name=$(jq -r '.VisibleName' "$metadata" 2>/dev/null)
+            doc_id=$(basename "$metadata" .metadata)
+            doc_age_days=$(( ($(date +%s) - $(stat -c %Y "$metadata")) / 86400 ))
+
+            # Check if document matches pattern and age
+            if [[ "$doc_name" == $pattern ]] && [ "$doc_age_days" -gt "$retention" ]; then
+                case "$action" in
+                    delete)
+                        echo "Deleting: $user/$doc_name (age: $doc_age_days days)"
+                        rm -f "$user_dir/$doc_id.zip"
+                        rm -f "$metadata"
+                        ;;
+                    archive)
+                        echo "Archiving: $user/$doc_name"
+                        mkdir -p "/archive/$user"
+                        mv "$user_dir/$doc_id.zip" "/archive/$user/"
+                        mv "$metadata" "/archive/$user/"
+                        ;;
+                esac
+            fi
+        done
+    done
+done < "$POLICY_CONFIG"
+```
+
+**Policy Configuration File:**
+```bash
+# /etc/rmfakecloud/lifecycle-policy.conf
+# Format: pattern,retention_days,action
+
+# Temporary documents - delete after 7 days
+Temp*,7,delete
+temp*,7,delete
+TEMP*,7,delete
+
+# Draft documents - delete after 30 days
+Draft*,30,delete
+draft*,30,delete
+
+# Patient charts - archive after 7 years
+Patient Chart*,2555,archive
+Medical Record*,2555,archive
+
+# Forms - delete after 1 year
+Form*,365,delete
+Consent*,2555,archive
+
+# Notes - delete after 90 days
+Notes*,90,delete
+Daily Note*,90,delete
+```
+
+### Web UI Document Management
+
+Administrators can manage documents through the web interface:
+
+**Access Control:**
+1. Login as admin user: `https://rmfakecloud.company.internal/`
+2. Navigate to "Users" → Select user
+3. View document list with metadata
+
+**Operations Available:**
+- **View:** List all documents with names and dates
+- **Download:** Export document as PDF (requires HWR for handwritten notes)
+- **Delete:** Move document to trash (syncs deletion to tablet)
+- **Rename:** Change document name
+- **Move:** Reorganize into folders
+
+**API Access for Automation:**
+
+```python
+#!/usr/bin/env python3
+# rmfakecloud-document-manager.py
+
+import requests
+import json
+
+class RmFakeCloudManager:
+    def __init__(self, base_url, admin_email, admin_password):
+        self.base_url = base_url
+        self.session = requests.Session()
+        self.login(admin_email, admin_password)
+
+    def login(self, email, password):
+        """Authenticate and get session cookie"""
+        response = self.session.post(
+            f"{self.base_url}/ui/api/login",
+            json={"email": email, "password": password}
+        )
+        response.raise_for_status()
+        return response.text
+
+    def list_documents(self, user_id):
+        """List all documents for a user"""
+        response = self.session.get(
+            f"{self.base_url}/ui/api/documents",
+            params={"userid": user_id}
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def delete_document(self, doc_id):
+        """Delete a document"""
+        response = self.session.delete(
+            f"{self.base_url}/ui/api/documents/{doc_id}"
+        )
+        response.raise_for_status()
+        return True
+
+    def bulk_delete_old_documents(self, user_id, days_old):
+        """Delete documents older than specified days"""
+        from datetime import datetime, timedelta
+
+        docs = self.list_documents(user_id)
+        cutoff_date = datetime.now() - timedelta(days=days_old)
+
+        deleted_count = 0
+        for doc in docs:
+            doc_date = datetime.fromisoformat(doc['ModifiedClient'])
+            if doc_date < cutoff_date:
+                print(f"Deleting: {doc['VissibleName']} (modified: {doc_date})")
+                self.delete_document(doc['ID'])
+                deleted_count += 1
+
+        return deleted_count
+
+# Usage
+if __name__ == "__main__":
+    manager = RmFakeCloudManager(
+        "https://rmfakecloud.company.internal",
+        "admin@company.internal",
+        "admin-password"
+    )
+
+    # Delete documents older than 90 days for user
+    deleted = manager.bulk_delete_old_documents("dr.smith@hospital.internal", 90)
+    print(f"Deleted {deleted} old documents")
+```
+
+### Sync Verification
+
+After performing lifecycle operations, verify tablets receive changes:
+
+```bash
+#!/bin/bash
+# verify-sync.sh - Monitor tablet sync after document operations
+
+USER_DIR="/data/users/$1"
+OPERATION_TIME=$(date +%s)
+
+echo "Monitoring $USER_DIR for sync activity..."
+echo "Performed operation at: $(date)"
+
+# Watch for file access (indicates sync)
+inotifywait -m -e access,modify,delete "$USER_DIR" | while read -r path action file; do
+    echo "[$(date)] Sync detected: $action on $file"
+done
+
+# Alternative: Check modification times
+echo "Waiting 5 minutes for sync..."
+sleep 300
+
+LATEST_CHANGE=$(find "$USER_DIR" -type f -printf '%T@\n' | sort -n | tail -1)
+LATEST_CHANGE_INT=${LATEST_CHANGE%.*}
+
+if [ "$LATEST_CHANGE_INT" -gt "$OPERATION_TIME" ]; then
+    echo "✓ Tablet has synced (last change: $(date -d @$LATEST_CHANGE_INT))"
+else
+    echo "✗ No sync detected. Tablet may be offline."
+fi
+```
 
 ---
 
@@ -1165,14 +2037,20 @@ rmfakecloud provides a robust, self-hosted alternative to the reMarkable cloud s
 - Environments with >5 reMarkable tablets
 - Companies requiring integration with existing infrastructure
 - Privacy-conscious deployments
+- Healthcare facilities (with proper security controls and compliance measures)
+- Environments requiring centralized document lifecycle management
 
 **Not recommended for:**
 - Remote/distributed teams (complex VPN setup needed)
 - Organizations without IT infrastructure
 - Users requiring mobile app sync
 - Deployments requiring high availability (file-based storage limitation)
+- HIPAA-covered entities without additional security controls and audit logging
+- Environments requiring immediate remote wipe capability
 
 For successful deployment, allocate time for proper security hardening, backup configuration, and user training. Regular maintenance including backups, updates, and monitoring is essential for reliable operation.
+
+**Healthcare/Medical Deployments:** Organizations deploying rmfakecloud for PHI storage must implement additional controls including audit logging, filesystem encryption, document retention policies, and device management procedures. Consult with compliance officers and legal counsel to ensure regulatory requirements are met. Review the [Healthcare/Medical Facility Deployment](#healthcaremedical-facility-deployment) section for detailed guidance on lifecycle management and compliance considerations.
 
 ---
 
